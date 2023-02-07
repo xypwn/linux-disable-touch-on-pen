@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Disable Touch on Pen
+Comment=Disables touch while pen is active
+Exec=~/.local/share/bin/disable-touch-on-pen
+Terminal=false
+Type=Application
+Categories=Utility;
