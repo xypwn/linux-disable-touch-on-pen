@@ -10,31 +10,71 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <time.h>
 
-bool stop = false;
-struct libevdev *penDevs[16] = {NULL};
-int nPenDevs = 0;
-struct pollfd penFds[16];
-struct libevdev *touchDevs[16] = {NULL};
-int nTouchDevs = 0;
+bool stop;
+
+#define CANERROR
+
+// Zero-initialized
+typedef struct {
+    char err[256];
+    struct libevdev *penDevs[16];
+    int nPenDevs;
+    struct pollfd penFds[16];
+    struct libevdev *touchDevs[16];
+    int nTouchDevs;
+} Devices;
 
 bool str_starts_with (const char *str, const char *prefix) {
     return strncmp(str, prefix, strlen(prefix)) == 0;
 }
 
-void catch_signal (int signum) {
+void catch_stop_signal (int signum) {
     stop = true;
+    printf("\nReceived signal");
+    switch (signum) {
+        case SIGINT: printf(" INT"); break;
+        case SIGTERM: printf(" TERM"); break;
+        default: printf(" %d", signum); break;
+    }
+    printf("\n");
 }
 
-void populate_pen_and_touch_devs (void) {
+CANERROR void devices_refresh (Devices *devs);
+
+CANERROR Devices devices(void) {
+    Devices devs = {0};
+    devices_refresh(&devs);
+    return devs;
+}
+
+void devices_cleanup (Devices *devs) {
+    for (size_t i = 0; i < devs->nPenDevs; i++) {
+        libevdev_free(devs->penDevs[i]);
+        close(libevdev_get_fd(devs->penDevs[i]));
+    }
+    for (size_t i = 0; i < devs->nTouchDevs; i++) {
+        libevdev_free(devs->touchDevs[i]);
+        close(libevdev_get_fd(devs->touchDevs[i]));
+    }
+}
+
+CANERROR void devices_refresh (Devices *devs) {
+    devices_cleanup(devs);
+
+    memset(devs, 0, sizeof(*devs));
+
     const char *dirName = "/dev/input";
     DIR *pDir = NULL;
     struct dirent *pDirEnt = NULL;
 
     if (!(pDir = opendir(dirName))) {
-        fprintf(stderr, "Failed to open directory /dev/input: %s\n", strerror(errno));
-        exit(1);
+        snprintf(devs->err, sizeof(devs->err), "failed to open directory \"%s\": %s", dirName, strerror(errno));
+        return;
     }
+
+    bool err_occurred = false;
     
     while ((pDirEnt = readdir(pDir))) {
         if (pDirEnt->d_type == DT_CHR && str_starts_with(pDirEnt->d_name, "event")) {
@@ -46,19 +86,26 @@ void populate_pen_and_touch_devs (void) {
             
             snprintf(fileName, sizeof(fileName), "%s/%s", dirName, pDirEnt->d_name);
             fd = open(fileName, O_RDWR | O_NONBLOCK);
+            if (fd == -1) {
+                snprintf(devs->err, sizeof(devs->err), "failed to get file descriptor for \"%s\": %s", fileName, strerror(errno));
+                err_occurred = true;
+                break;
+            }
             rc = libevdev_new_from_fd(fd, &dev);
             if (rc < 0) {
-                fprintf(stderr, "Failed to open device %s: %s\n", fileName, strerror(-rc));
-                exit(1);
+                snprintf(devs->err, sizeof(devs->err), "failed to open device \"%s\": %s", fileName, strerror(-rc));
+                err_occurred = true;
+                close(fd);
+                break;
             }
 
             if (libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_PEN) && libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_RUBBER)) {
-                if (nPenDevs < 16)
-                    penDevs[nPenDevs++] = dev;
+                if (devs->nPenDevs < 16)
+                    devs->penDevs[devs->nPenDevs++] = dev;
                 dontFree = true;
             } else if (libevdev_has_event_code(dev, EV_KEY, BTN_TOUCH) && !libevdev_has_property(dev, INPUT_PROP_POINTER)) {
-                if (nPenDevs < 16)
-                    touchDevs[nTouchDevs++] = dev;
+                if (devs->nPenDevs < 16)
+                    devs->touchDevs[devs->nTouchDevs++] = dev;
                 dontFree = true;
             }
             
@@ -70,93 +117,147 @@ void populate_pen_and_touch_devs (void) {
     }
     
     closedir(pDir);
+
+    if (err_occurred) {
+        devices_cleanup(devs);
+        return;
+    }
+
+    for (size_t i = 0; i < devs->nPenDevs; i++) {
+        devs->penFds[i].fd = libevdev_get_fd(devs->penDevs[i]);
+        devs->penFds[i].events = POLLIN;
+        devs->penFds[i].revents = 0;
+    }
 }
 
-void cleanup_pen_and_touch_devs (void) {
-    for (size_t i = 0; i < nPenDevs; i++) {
-        libevdev_free(penDevs[i]);
-        close(libevdev_get_fd(penDevs[i]));
+CANERROR int devices_poll (Devices *devs, int timeout_ms) {
+    int rc = 1;
+    rc = poll(devs->penFds, devs->nPenDevs, timeout_ms);
+    if (rc < 0) {
+        if (errno == EINTR)
+            return 0;
+        snprintf(devs->err, sizeof(devs->err), "failed to poll events: %s", strerror(errno));
+        return 0;
     }
-    for (size_t i = 0; i < nTouchDevs; i++) {
-        libevdev_free(touchDevs[i]);
-        close(libevdev_get_fd(touchDevs[i]));
+
+    for (size_t i = 0; i < devs->nPenDevs; i++) {
+        if (devs->penFds[i].revents & POLLERR) {
+            snprintf(devs->err, sizeof(devs->err), "failed to poll events: error from device \"%s\"", libevdev_get_name(devs->penDevs[i]));
+            return 0;
+        }
+        if (devs->penFds[i].revents & POLLHUP) {
+            snprintf(devs->err, sizeof(devs->err), "failed to poll events: device \"%s\" hung up", libevdev_get_name(devs->penDevs[i]));
+            return 0;
+        }
     }
+    return rc;
 }
 
-void enable_disable_touch (bool disable) {
-    for (size_t i = 0; i < nTouchDevs; i++) {
+CANERROR void devices_grab_touch_devs (Devices *devs, bool grab) {
+    for (size_t i = 0; i < devs->nTouchDevs; i++) {
         int rc = 1;
-        rc = libevdev_grab(touchDevs[i], disable ? LIBEVDEV_GRAB : LIBEVDEV_UNGRAB);
+        rc = libevdev_grab(devs->touchDevs[i], grab ? LIBEVDEV_GRAB : LIBEVDEV_UNGRAB);
         if (rc < 0) {
-            fprintf(stderr, "Failed to %s device %s: %s\n",
-                disable ? "grab" : "ungrab",
-                libevdev_get_name(touchDevs[i]),
+            snprintf(devs->err, sizeof(devs->err), "failed to %s device \"%s\": %s",
+                grab ? "grab" : "ungrab",
+                libevdev_get_name(devs->touchDevs[i]),
                 strerror(-rc));
-            exit(1);
+            return;
         }
     }
 }
 
-void populate_pen_poll_fds (void) {
-    for (size_t i = 0; i < nPenDevs; i++) {
-        penFds[i].fd = libevdev_get_fd(penDevs[i]);
-        penFds[i].events = POLLIN;
-        penFds[i].revents = 0;
+void print_devices (const Devices *devs) {
+    printf("Pens: ");
+    for (size_t i = 0; i < devs->nPenDevs; i++) {
+        if (i != 0)
+            printf(", ");
+        printf("\"%s\"", libevdev_get_name(devs->penDevs[i]));
     }
-}
-
-bool poll_pen_events (int timeout_ms) {
-    int rc = 1;
-    rc = poll(penFds, nPenDevs, timeout_ms);
-    if (rc < 0) {
-        fprintf(stderr, "Failed to poll events: %s\n", strerror(errno));
-        return false;
+    printf("\n");
+    printf("Touchscreens: ");
+    for (size_t i = 0; i < devs->nTouchDevs; i++) {
+        if (i != 0)
+            printf(", ");
+        printf("\"%s\"", libevdev_get_name(devs->touchDevs[i]));
     }
-    return rc > 0;
+    printf("\n");
 }
 
 int main (int argc, const char **argv) {
-    populate_pen_and_touch_devs();
-    populate_pen_poll_fds();
-    
-    printf("Pen devices:\n");
-    for (size_t i = 0; i < nPenDevs; i++) {
-        printf("  %s\n", libevdev_get_name(penDevs[i]));
-    }
-    printf("Touch devices:\n");
-    for (size_t i = 0; i < nTouchDevs; i++) {
-        printf("  %s\n", libevdev_get_name(touchDevs[i]));
-    }
-    
-    signal(SIGINT, catch_signal);
-    signal(SIGTERM, catch_signal);
-    
+    signal(SIGINT, catch_stop_signal);
+    signal(SIGTERM, catch_stop_signal);
+
+    bool restart;
+
     while (!stop) {
-        if (poll_pen_events(20)) {
-            for (size_t i = 0; i < nPenDevs; i++) {
-                if (penFds[i].revents & POLLIN) {
-                    struct input_event penEvent;
+        if (restart)
+            printf("Restarting, press Ctrl+C to stop\n");
+
+        printf("Initializing devices\n");
+
+        restart = false;
+
+        time_t lastRefresh = time(NULL);
+        Devices devs = devices();
+        if (devs.err[0] != 0) {
+            fprintf(stderr, "Error getting devices: %s\n", devs.err);
+            restart = true;
+            sleep(1);
+            continue;
+        }
+
+        print_devices(&devs);
+
+        while (!stop && !restart) {
+            time_t now = time(NULL);
+            if (now - lastRefresh > 10) {
+                lastRefresh = now;
+                printf("Refreshing devices\n");
+                devices_refresh(&devs);
+                if (devs.err[0] != 0) {
+                    fprintf(stderr, "Error refreshing devices: %s\n", devs.err);
+                    restart = true;
+                    sleep(1);
+                    continue;
+                }
+                print_devices(&devs);
+            }
+
+            if (devices_poll(&devs, 20)) {
+                for (size_t i = 0; i < devs.nPenDevs; i++) {
+                    struct input_event ev;
                     int rc = 1;
-                    rc = libevdev_next_event(penDevs[i], LIBEVDEV_READ_FLAG_NORMAL, &penEvent);
-                    if (rc < 0) {
-                        fprintf(stderr, "Failed to get next event: %s\n", strerror(-rc));
-                        return 1;
+                    rc = libevdev_next_event(devs.penDevs[i], LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                    if (rc == -EAGAIN)
+                        continue; // No events pending
+                    else if (rc < 0) {
+                        fprintf(stderr, "Error: failed to get next event for device \"%s\": %s", libevdev_get_name(devs.penDevs[i]), strerror(-rc));
+                        restart = true;
+                        break;
                     }
-                    if (penEvent.type == EV_KEY &&
-                        (penEvent.code == BTN_TOOL_PEN || penEvent.code == BTN_TOOL_RUBBER) &&
-                        (penEvent.value == 0 || penEvent.value == 1)) {
-                        printf("touch %s\n", penEvent.value == 1 ? "disabled" : "re-enabled");
-                        enable_disable_touch(penEvent.value == 1);
+                    if (ev.type == EV_KEY &&
+                        (ev.code == BTN_TOOL_PEN || ev.code == BTN_TOOL_RUBBER) &&
+                        (ev.value == 0 || ev.value == 1)) {
+                        printf("Touch %s\n", ev.value == 1 ? "disabled" : "re-enabled");
+                        devices_grab_touch_devs(&devs, ev.value == 1);
+                        if (devs.err[0] != 0) {
+                            fprintf(stderr, "Error: %s\n", devs.err);
+                            restart = true;
+                            break;
+                        }
                     }
-                } else if (penFds[i].revents & POLLERR) {
-                    fprintf(stderr, "Error polling events from device %s\n", libevdev_get_name(penDevs[i]));
-                    return 1;
+                }
+            } else {
+                if (devs.err[0] != 0) {
+                    fprintf(stderr, "Error: %s\n", devs.err);
+                    restart = true;
                 }
             }
         }
+
+        printf("Cleaning up\n");
+
+        devices_cleanup(&devs);
     }
-    
-    fprintf(stderr, "Exiting\n");
-    
-    cleanup_pen_and_touch_devs();
 }
