@@ -41,7 +41,8 @@ void catch_stop_signal (int signum) {
     printf("\n");
 }
 
-CANERROR void devices_refresh (Devices *devs);
+CANERROR bool devices_refresh (Devices *devs);
+CANERROR void devices_grab_touch_devs (Devices *devs, bool grab);
 
 CANERROR Devices devices(void) {
     Devices devs = {0};
@@ -49,7 +50,9 @@ CANERROR Devices devices(void) {
     return devs;
 }
 
-void devices_cleanup (Devices *devs) {
+void devices_cleanup (Devices *devs, bool ungrab) {
+    if (ungrab)
+        devices_grab_touch_devs(devs, false);
     for (size_t i = 0; i < devs->nPenDevs; i++) {
         libevdev_free(devs->penDevs[i]);
         close(libevdev_get_fd(devs->penDevs[i]));
@@ -60,10 +63,11 @@ void devices_cleanup (Devices *devs) {
     }
 }
 
-CANERROR void devices_refresh (Devices *devs) {
-    devices_cleanup(devs);
+// Returns true if any devices changed
+CANERROR bool devices_refresh (Devices *devs) {
+    Devices oldDevs = *devs;
 
-    memset(devs, 0, sizeof(*devs));
+    *devs = (Devices){0};
 
     const char *dirName = "/dev/input";
     DIR *pDir = NULL;
@@ -71,11 +75,11 @@ CANERROR void devices_refresh (Devices *devs) {
 
     if (!(pDir = opendir(dirName))) {
         snprintf(devs->err, sizeof(devs->err), "failed to open directory \"%s\": %s", dirName, strerror(errno));
-        return;
+        return false;
     }
 
     bool err_occurred = false;
-    
+
     while ((pDirEnt = readdir(pDir))) {
         if (pDirEnt->d_type == DT_CHR && str_starts_with(pDirEnt->d_name, "event")) {
             char fileName[256];
@@ -115,12 +119,12 @@ CANERROR void devices_refresh (Devices *devs) {
             }
         }
     }
-    
+
     closedir(pDir);
 
     if (err_occurred) {
-        devices_cleanup(devs);
-        return;
+        devices_cleanup(devs, true);
+        return false;
     }
 
     for (size_t i = 0; i < devs->nPenDevs; i++) {
@@ -128,6 +132,29 @@ CANERROR void devices_refresh (Devices *devs) {
         devs->penFds[i].events = POLLIN;
         devs->penFds[i].revents = 0;
     }
+
+    bool changed = false;
+    if (oldDevs.nPenDevs != devs->nPenDevs)
+        changed = true;
+    if (oldDevs.nTouchDevs != devs->nTouchDevs)
+        changed = true;
+    for (size_t i = 0; !changed && i < oldDevs.nPenDevs; i++) {
+        if (strcmp(libevdev_get_name(oldDevs.penDevs[i]), libevdev_get_name(devs->penDevs[i])) != 0)
+            changed = true;
+    }
+    for (size_t i = 0; !changed && i < oldDevs.nTouchDevs; i++) {
+        if (strcmp(libevdev_get_name(oldDevs.touchDevs[i]), libevdev_get_name(devs->touchDevs[i])) != 0)
+            changed = true;
+    }
+
+    if (changed)
+        devices_cleanup(&oldDevs, true);
+    else {
+        devices_cleanup(devs, false);
+        *devs = oldDevs;
+    }
+
+    return changed;
 }
 
 CANERROR int devices_poll (Devices *devs, int timeout_ms) {
@@ -212,16 +239,20 @@ int main (int argc, const char **argv) {
         while (!stop && !restart) {
             time_t now = time(NULL);
             if (now - lastRefresh > 10) {
+                bool changed = false;
                 lastRefresh = now;
                 printf("Refreshing devices\n");
-                devices_refresh(&devs);
+                changed = devices_refresh(&devs);
                 if (devs.err[0] != 0) {
                     fprintf(stderr, "Error refreshing devices: %s\n", devs.err);
                     restart = true;
                     sleep(1);
                     continue;
                 }
-                print_devices(&devs);
+                if (changed) {
+                    printf("Devices changed\n");
+                    print_devices(&devs);
+                }
             }
 
             if (devices_poll(&devs, 20)) {
@@ -258,6 +289,6 @@ int main (int argc, const char **argv) {
 
         printf("Cleaning up\n");
 
-        devices_cleanup(&devs);
+        devices_cleanup(&devs, true);
     }
 }
