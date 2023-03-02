@@ -54,12 +54,12 @@ void devices_cleanup (Devices *devs, bool ungrab) {
     if (ungrab)
         devices_grab_touch_devs(devs, false);
     for (size_t i = 0; i < devs->nPenDevs; i++) {
-        libevdev_free(devs->penDevs[i]);
         close(libevdev_get_fd(devs->penDevs[i]));
+        libevdev_free(devs->penDevs[i]);
     }
     for (size_t i = 0; i < devs->nTouchDevs; i++) {
-        libevdev_free(devs->touchDevs[i]);
         close(libevdev_get_fd(devs->touchDevs[i]));
+        libevdev_free(devs->touchDevs[i]);
     }
 }
 
@@ -78,7 +78,7 @@ CANERROR bool devices_refresh (Devices *devs) {
         return false;
     }
 
-    bool err_occurred = false;
+    bool errOccurred = false;
 
     while ((pDirEnt = readdir(pDir))) {
         if (pDirEnt->d_type == DT_CHR && str_starts_with(pDirEnt->d_name, "event")) {
@@ -91,14 +91,14 @@ CANERROR bool devices_refresh (Devices *devs) {
             snprintf(fileName, sizeof(fileName), "%s/%s", dirName, pDirEnt->d_name);
             fd = open(fileName, O_RDWR | O_NONBLOCK);
             if (fd == -1) {
-                snprintf(devs->err, sizeof(devs->err), "failed to get file descriptor for \"%s\": %s", fileName, strerror(errno));
-                err_occurred = true;
+                snprintf(devs->err, sizeof(devs->err), "failed to open \"%s\": %s", fileName, strerror(errno));
+                errOccurred = true;
                 break;
             }
             rc = libevdev_new_from_fd(fd, &dev);
             if (rc < 0) {
                 snprintf(devs->err, sizeof(devs->err), "failed to open device \"%s\": %s", fileName, strerror(-rc));
-                err_occurred = true;
+                errOccurred = true;
                 close(fd);
                 break;
             }
@@ -114,15 +114,15 @@ CANERROR bool devices_refresh (Devices *devs) {
             }
             
             if (!dontFree) {
-                libevdev_free(dev);
                 close(libevdev_get_fd(dev));
+                libevdev_free(dev);
             }
         }
     }
 
     closedir(pDir);
 
-    if (err_occurred) {
+    if (errOccurred) {
         devices_cleanup(devs, true);
         return false;
     }
@@ -215,7 +215,7 @@ int main (int argc, const char **argv) {
     signal(SIGINT, catch_stop_signal);
     signal(SIGTERM, catch_stop_signal);
 
-    bool restart;
+    bool restart = false;
 
     while (!stop) {
         if (restart)
@@ -238,10 +238,9 @@ int main (int argc, const char **argv) {
 
         while (!stop && !restart) {
             time_t now = time(NULL);
-            if (now - lastRefresh > 10) {
+            if (now - lastRefresh > 4) {
                 bool changed = false;
                 lastRefresh = now;
-                printf("Refreshing devices\n");
                 changed = devices_refresh(&devs);
                 if (devs.err[0] != 0) {
                     fprintf(stderr, "Error refreshing devices: %s\n", devs.err);
